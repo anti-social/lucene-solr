@@ -153,7 +153,7 @@ public class Grouping {
       gc.format = Grouping.Format.simple;
     }
 
-    if (gc.format == Grouping.Format.simple) {
+    if (gc.format == Grouping.Format.simple || gc.format == Grouping.Format.custom) {
       gc.groupOffset = 0;  // doesn't make sense
     }
     commands.add(gc);
@@ -195,7 +195,7 @@ public class Grouping {
       gc.format = Grouping.Format.simple;
     }
 
-    if (gc.format == Grouping.Format.simple) {
+    if (gc.format == Grouping.Format.simple || gc.format == Grouping.Format.custom) {
       gc.groupOffset = 0;  // doesn't make sense
     }
 
@@ -222,7 +222,7 @@ public class Grouping {
       gc.main = true;
       gc.format = Grouping.Format.simple;
     }
-    if (gc.format == Grouping.Format.simple) {
+    if (gc.format == Grouping.Format.simple || gc.format == Grouping.Format.custom) {
       gc.docsPerGroup = gc.numGroups;  // doesn't make sense to limit to one
       gc.groupOffset = gc.offset;
     }
@@ -468,7 +468,12 @@ public class Grouping {
     /**
      * Flat result. All documents of all groups are put in one list.
      */
-    simple
+    simple,
+
+    /**
+     * Flat result. All documents of all groups are put in one list sorted by special rules.
+     */
+    custom
   }
 
   public static enum TotalCount {
@@ -592,6 +597,10 @@ public class Grouping {
         off = offset;
         len = numGroups;
       }
+      else if (format == Format.custom) {
+        off = offset;
+        len = numGroups;
+      }
       int docsToCollect = getMax(off, len, max);
 
       // TODO: implement a DocList impl that doesn't need to start at offset=0
@@ -660,6 +669,80 @@ public class Grouping {
       }
 
       return docSlice;
+    }
+
+    // Flatten the groups and get up offset + rows documents with custom rules
+    protected DocList createCustomResponse() {
+      SortField sortField = sort.getSort()[0];
+      SortField groupSortField = groupSort.getSort()[0];
+      if (sortField.getType() != SortField.Type.SCORE
+          || groupSortField.getType() != SortField.Type.SCORE) {
+        return createSimpleResponse();
+      }
+
+      logger.info("Command::createCustomResponse");
+        
+      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
+
+      List<Integer> ids = new ArrayList<Integer>();
+      List<Float> scores = new ArrayList<Float>();
+      // List<Float> customScores = new ArrayList<Float>();
+      List<ScoreDoc> scoreDocs = new ArrayList<ScoreDoc>();
+      int groupsToGather = getMax(offset, numGroups, maxDoc);
+      int groupsGathered = 0;
+      int docsGathered = 0;
+      float maxScore = Float.NEGATIVE_INFINITY;
+
+      for (GroupDocs group : groups) {
+        if (groupsGathered >= groupsToGather) {
+          break;
+        }
+        
+        int pos = 0;
+        for (ScoreDoc scoreDoc : group.scoreDocs) {
+          scoreDocs.add(new ScoreDoc(scoreDoc.doc, scoreDoc.score * ((float)1 / (4 * pos + 2) + 0.5f)));
+          docsGathered++;
+            
+          pos++;
+          if (pos >= groupsToGather - groupsGathered) {
+            break;
+          }
+        }
+
+        groupsGathered++;
+      }
+
+      Collections.sort(scoreDocs, new ScoreDocComparator());
+      if (!scoreDocs.isEmpty()) {
+        maxScore = scoreDocs.get(0).score;
+      }
+      
+      for (ScoreDoc scoreDoc : scoreDocs) {
+        ids.add(scoreDoc.doc);
+        scores.add(scoreDoc.score);
+      }
+      
+      int len = Math.min(docsGathered > offset ? docsGathered - offset : 0, numGroups);
+      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
+      float[] docScores = ArrayUtils.toPrimitive(scores.toArray(new Float[scores.size()]));
+      DocSlice docSlice = new DocSlice(offset, len, docs, docScores, getMatches(), maxScore);
+
+      if (getDocList) {
+        for (int i = offset; i < docs.length; i++) {
+          idSet.add(docs[i]);
+        }
+      }
+
+      return docSlice;
+    }
+    
+    private class ScoreDocComparator implements Comparator<ScoreDoc> {
+      @Override
+      public int compare(ScoreDoc d1, ScoreDoc d2) {
+        if (d1.score > d2.score) return -1;
+        if (d1.score == d2.score) return 0;
+        return 1;
+      }
     }
 
   }
@@ -759,6 +842,10 @@ public class Grouping {
 
       if (format == Format.simple) {
         groupResult.add("doclist", createSimpleResponse());
+        return;
+      }
+      else if (format == Format.custom) {
+        groupResult.add("doclist", createCustomResponse());
         return;
       }
 
@@ -966,6 +1053,10 @@ public class Grouping {
 
       if (format == Format.simple) {
         groupResult.add("doclist", createSimpleResponse());
+        return;
+      }
+      else if (format == Format.custom) {
+        groupResult.add("doclist", createCustomResponse());
         return;
       }
 
