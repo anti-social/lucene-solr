@@ -23,6 +23,7 @@ import org.apache.lucene.queries.function.BoostedQuery;
 import org.apache.lucene.queries.function.FunctionValues;
 import org.apache.lucene.queries.function.ValueSource;
 import org.apache.lucene.queries.function.docvalues.BoolDocValues;
+import org.apache.lucene.queries.function.docvalues.IntDocValues;
 import org.apache.lucene.queries.function.docvalues.DoubleDocValues;
 import org.apache.lucene.queries.function.docvalues.LongDocValues;
 import org.apache.lucene.queries.function.valuesource.*;
@@ -774,6 +775,13 @@ public abstract class ValueSourceParser implements NamedListInitializedPlugin {
       }
     });
 
+    addParser("_pos_", new ValueSourceParser() {
+      @Override
+      public ValueSource parse(FunctionQParser fp) throws ParseException {
+        return new PositionWithinGroupValueSource();
+      }
+    });
+
   }
 
   private static TInfo parseTerm(FunctionQParser fp) throws ParseException {
@@ -862,6 +870,44 @@ public abstract class ValueSourceParser implements NamedListInitializedPlugin {
 
 }
 
+
+class PositionWithinGroupValueSource extends ValueSource {
+
+  @Override
+  public boolean equals(Object o) {
+    if (o.getClass() != PositionWithinGroupValueSource.class) {
+      return false;
+    }
+    return true;
+  }
+
+  public String name() {
+    return "_pos_";
+  }
+  @Override
+  public String description() {
+    return name() + "()";
+  }
+
+  @Override
+  public int hashCode() {
+    return name().hashCode();
+  }
+
+  @Override
+  public FunctionValues getValues(Map context, AtomicReaderContext readerContext) throws IOException {
+    final Map<Integer, Integer> docPositions = (Map<Integer, Integer>)context.get("docPositions");
+    
+    return new IntDocValues(this) {
+      @Override
+      public int intVal(int doc) {
+        return docPositions.get(doc);
+      }
+    };
+  }
+
+}
+  
 
 class DateValueSourceParser extends ValueSourceParser {
   DateField df = new TrieDateField();
