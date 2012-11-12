@@ -97,6 +97,18 @@ sammy.get
             }
           );
 
+        $( '.add_input' )
+          .die( 'click' )
+          .live
+          (
+            'click',
+            function( event )
+            {
+              var input = $( this ).prev();
+              input.clone().removeAttr("id").val("").insertAfter(input);
+            }
+          );
+
         query_form
           .die( 'submit' )
           .live

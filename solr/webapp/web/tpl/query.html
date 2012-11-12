@@ -38,6 +38,7 @@ limitations under the License.
           <a rel="help">fq</a>
         </label>
         <input type="text" id="fq" name="fq" class="multiple" title="Filter query.">
+        <a href="javascript: void(0)" class="add_input">+</a>
 
         <label for="sort">
           <a rel="help">sort</a>
@@ -211,13 +212,45 @@ limitations under the License.
 
         <label for="facet_query">facet.query</label>
         <textarea name="facet.query" id="facet_query"></textarea>
+        <a href="javascript: void(0)" class="add_input">+</a>
 
         <label for="facet_field">facet.field</label>
         <input type="text" name="facet.field" id="facet_field">
+        <a href="javascript: void(0)" class="add_input">+</a>
+
+        <label for="facet_limit">facet.limit</label>
+        <input type="text" name="facet.limit" id="facet_limit">
+
+        <label for="facet_mincount">facet.mincount</label>
+        <input type="text" name="facet.mincount" id="facet_mincount">
 
         <label for="facet_prefix">facet.prefix</label>
         <input type="text" name="facet.prefix" id="facet_prefix">
 
+        </div>
+      </fieldset>
+
+      <fieldset class="group optional">
+        <legend>
+          <label for="group" class="checkbox">
+            <input type="checkbox" name="group" id="group" value="true">
+            group
+          </label>
+        </legend>
+        
+        <div class="fieldset">
+          <label for="group_field">group.field</label>
+          <input name="group.field" id="group_field">
+          <a href="javascript: void(0)" class="add_input">+</a>
+
+          <label for="group_limit">group.limit</label>
+          <input name="group.limit" id="group_limit">
+
+          <label for="group_format">group.format</label>
+          <input name="group.format" id="group_format">
+
+          <label for="group_bf">group.bf</label>
+          <input name="group.bf" id="group_bf">
         </div>
       </fieldset>
 
@@ -294,6 +327,19 @@ limitations under the License.
         <label for="spellcheck_accuracy">spellcheck.accuracy</label>
         <input type="text" name="spellcheck.accuracy" id="spellcheck_accuracy">
       
+      </fieldset>
+
+      <fieldset class="custom optional">
+        <legend>
+          <label>
+            custom
+          </label>
+        </legend>
+        
+        <div class="fieldset">
+          <input class="custom_input">
+          <a href="javascript: void(0)" class="add_input">+</a>
+        </div>
       </fieldset>
 
 
