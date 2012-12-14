@@ -1,4 +1,10 @@
 
+# Emacs
+*~
+\#*#
+.\#*
+
+
 *.jar
 
 # .
@@ -145,6 +151,10 @@
 
 # ./solr/example/exampledocs
 /solr/example/exampledocs/post.jar
+
+
+# ./solr/example/solr/*/data
+/solr/example/solr/*/data/
 
 
 # ./solr/example/multicore/core1
