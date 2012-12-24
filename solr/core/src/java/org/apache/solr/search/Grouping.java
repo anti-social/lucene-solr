@@ -149,6 +149,7 @@ public class Grouping {
     gc.format = defaultFormat;
     gc.totalCount = defaultTotalCount;
     gc.groupedScoreValueSource = null;
+    gc.docsPerGroupCustom = gc.docsPerGroup;
 
     String customScoreBoostFunc = request.getParams().get("group.bf");
     if (customScoreBoostFunc != null) {
@@ -164,8 +165,10 @@ public class Grouping {
       gc.format = Grouping.Format.simple;
     }
 
-    if (gc.format == Grouping.Format.simple || gc.format == Grouping.Format.custom) {
+    if (gc.format == Grouping.Format.simple) {
       gc.groupOffset = 0;  // doesn't make sense
+    } else if (gc.format == Grouping.Format.custom) {
+      gc.docsPerGroup = gc.numGroups;
     }
     commands.add(gc);
   }
@@ -200,14 +203,17 @@ public class Grouping {
     gc.sort = sort;
     gc.format = defaultFormat;
     gc.totalCount = defaultTotalCount;
+    gc.docsPerGroupCustom = gc.docsPerGroup;
 
     if (main) {
       gc.main = true;
       gc.format = Grouping.Format.simple;
     }
 
-    if (gc.format == Grouping.Format.simple || gc.format == Grouping.Format.custom) {
+    if (gc.format == Grouping.Format.simple) {
       gc.groupOffset = 0;  // doesn't make sense
+    } else if (gc.format == Grouping.Format.custom) {
+      gc.docsPerGroup = gc.numGroups;
     }
 
     commands.add(gc);
@@ -512,6 +518,7 @@ public class Grouping {
     public Sort groupSort;   // the sort of the documents *within* a single group.
     public Sort sort;        // the sort between groups
     public int docsPerGroup; // how many docs in each group - from "group.limit" param, default=1
+    public int docsPerGroupCustom; //used by custom search to store actual docsPerGroup
     public int groupOffset;  // the offset within each group (for paging within each group)
     public int numGroups;    // how many groups - defaults to the "rows" parameter
     int actualGroupsToFind;  // How many groups should actually be found. Based on groupOffset and numGroups.
@@ -609,11 +616,10 @@ public class Grouping {
       if (format == Format.simple) {
         off = offset;
         len = numGroups;
+      } else if (format == Format.custom) {
+        len = docsPerGroupCustom;
       }
-      else if (format == Format.custom) {
-        off = offset;
-        len = numGroups;
-      }
+
       int docsToCollect = getMax(off, len, max);
 
       // TODO: implement a DocList impl that doesn't need to start at offset=0
@@ -685,20 +691,18 @@ public class Grouping {
     }
 
     // Flatten the groups and get up offset + rows documents with custom rules
-    protected DocList createCustomResponse() throws IOException {
+    protected GroupDocs[] createCustomResponse() throws IOException {
+      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
       SortField sortField = sort.getSort()[0];
       SortField groupSortField = groupSort.getSort()[0];
       if (sortField.getType() != SortField.Type.SCORE
           || groupSortField.getType() != SortField.Type.SCORE) {
-        return createSimpleResponse();
+        return groups;
       }
 
       logger.info("Command::createCustomResponse");
-        
-      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
 
       List<Integer> ids = new ArrayList<Integer>();
-      List<Float> scores = new ArrayList<Float>();
       List<CustomScoreDoc> customScoreDocs = new ArrayList<CustomScoreDoc>();
       int groupsToGather = getMax(offset, numGroups, maxDoc);
       int groupsGathered = 0;
@@ -706,8 +710,9 @@ public class Grouping {
       float maxScore = Float.NEGATIVE_INFINITY;
 
       Map<Integer, Integer> docPositions = new HashMap<Integer, Integer>();
+      Map<GROUP_VALUE_TYPE, GroupDocs> groupsMap = new HashMap<GROUP_VALUE_TYPE, GroupDocs>();
 
-      for (GroupDocs group : groups) {
+      for (GroupDocs<GROUP_VALUE_TYPE> group : groups) {
         if (groupsGathered >= groupsToGather) {
           break;
         }
@@ -715,15 +720,16 @@ public class Grouping {
         int pos = 0;
         for (ScoreDoc scoreDoc : group.scoreDocs) {
           docPositions.put(scoreDoc.doc, pos);
-          customScoreDocs.add(new CustomScoreDoc(scoreDoc.doc, scoreDoc.score, scoreDoc.shardIndex));
+          customScoreDocs.add(new CustomScoreDoc(scoreDoc.doc, scoreDoc.score, scoreDoc.shardIndex, group.groupValue));
           docsGathered++;
             
           pos++;
-          if (pos >= groupsToGather - groupsGathered) {
+          if (pos >= groupsToGather - groupsGathered + docsPerGroupCustom) {
             break;
           }
         }
 
+        groupsMap.put(group.groupValue, group);
         groupsGathered++;
       }
 
@@ -734,7 +740,7 @@ public class Grouping {
         FunctionValues values = groupedScoreValueSource.getValues(context, null);
 
         for (CustomScoreDoc scoreDoc : customScoreDocs) {
-          scoreDoc.customScore = values.floatVal(scoreDoc.doc) * scoreDoc.score;
+          scoreDoc.score = values.floatVal(scoreDoc.doc) * scoreDoc.score;
         }
       }
 
@@ -742,44 +748,68 @@ public class Grouping {
       if (!customScoreDocs.isEmpty()) {
         maxScore = customScoreDocs.get(0).score;
       }
-      
+
+      Map<Integer, Float> customScores = new HashMap<Integer, Float>();
       for (CustomScoreDoc scoreDoc : customScoreDocs) {
         ids.add(scoreDoc.doc);
-        scores.add(scoreDoc.customScore);
+        customScores.put(scoreDoc.doc, scoreDoc.score);
       }
-      
+
       int len = Math.min(docsGathered > offset ? docsGathered - offset : 0, numGroups);
       int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
-      float[] docScores = ArrayUtils.toPrimitive(scores.toArray(new Float[scores.size()]));
-      DocSlice docSlice = new DocSlice(offset, len, docs, docScores, getMatches(), maxScore);
+
+      if (len == 0) {
+        return new GroupDocs[0];
+      }
+
+      List<GroupDocs> newGroups = new ArrayList<GroupDocs>();
+      for(CustomScoreDoc scoreDoc: customScoreDocs.subList(offset, offset + len)) {
+        GroupDocs group = groupsMap.get(scoreDoc.groupValue);
+        List<ScoreDoc> groupedValues = new ArrayList<ScoreDoc>(Arrays.asList(group.scoreDocs));
+        ListIterator<ScoreDoc> groupedIter = groupedValues.listIterator();
+        while(groupedIter.hasNext()) {
+          ScoreDoc doc = groupedIter.next();
+          if(doc.doc == scoreDoc.doc) {
+            groupedIter.remove();
+          }
+        }
+        groupedValues.add(0, scoreDoc);
+        if(groupedValues.size() > docsPerGroupCustom) {
+          groupedValues = groupedValues.subList(0, docsPerGroupCustom);
+        }
+        for(ScoreDoc doc: groupedValues) {
+            doc.score = customScores.get(doc.doc);
+        }
+        newGroups.add(new GroupDocs<GROUP_VALUE_TYPE>(
+            Float.NaN, scoreDoc.score, group.totalHits, groupedValues.toArray(new ScoreDoc[0]), scoreDoc.groupValue, null));
+      }
 
       if (getDocList) {
         for (int i = offset; i < docs.length; i++) {
           idSet.add(docs[i]);
         }
       }
-
-      return docSlice;
+      return newGroups.toArray(new GroupDocs[0]);
     }
 
     private class CustomScoreDoc extends ScoreDoc {
-      public float customScore;
+      public GROUP_VALUE_TYPE groupValue;
 
-      public CustomScoreDoc(int doc, float score) {
-        this(doc, score, -1);
+      public CustomScoreDoc(int doc, float score, GROUP_VALUE_TYPE groupValue) {
+        this(doc, score, -1, groupValue);
       }
       
-      public CustomScoreDoc(int doc, float score, int shardIndex) {
+      public CustomScoreDoc(int doc, float score, int shardIndex, GROUP_VALUE_TYPE groupValue) {
         super(doc, score, shardIndex);
-        this.customScore = score;
+        this.groupValue = groupValue;
       }
     }
     
     private class CustomScoreDocComparator implements Comparator<CustomScoreDoc> {
       @Override
       public int compare(CustomScoreDoc d1, CustomScoreDoc d2) {
-        if (d1.customScore > d2.customScore) return -1;
-        if (d1.customScore == d2.customScore) return 0;
+        if (d1.score > d2.score) return -1;
+        if (d1.score == d2.score) return 0;
         return 1;
       }
     }
@@ -883,11 +913,6 @@ public class Grouping {
         groupResult.add("doclist", createSimpleResponse());
         return;
       }
-      else if (format == Format.custom) {
-        groupResult.add("doclist", createCustomResponse());
-        return;
-      }
-
       List groupList = new ArrayList();
       groupResult.add("groups", groupList);        // grouped={ key={ groups=[
 
@@ -895,10 +920,15 @@ public class Grouping {
         return;
       }
 
+      GroupDocs[] groups = result.groups;
+      if (format == Format.custom) {
+        groups = createCustomResponse();
+      }
+
       // handle case of rows=0
       if (numGroups == 0) return;
 
-      for (GroupDocs<BytesRef> group : result.groups) {
+      for (GroupDocs<BytesRef> group : groups) {
         NamedList nl = new SimpleOrderedMap();
         groupList.add(nl);                         // grouped={ key={ groups=[ {
 
@@ -1094,11 +1124,6 @@ public class Grouping {
         groupResult.add("doclist", createSimpleResponse());
         return;
       }
-      else if (format == Format.custom) {
-        groupResult.add("doclist", createCustomResponse());
-        return;
-      }
-
       List groupList = new ArrayList();
       groupResult.add("groups", groupList);        // grouped={ key={ groups=[
 
@@ -1106,10 +1131,15 @@ public class Grouping {
         return;
       }
 
+      GroupDocs[] groups = result.groups;
+      if (format == Format.custom) {
+        groups = createCustomResponse();
+      }
+
       // handle case of rows=0
       if (numGroups == 0) return;
 
-      for (GroupDocs<MutableValue> group : result.groups) {
+      for (GroupDocs<MutableValue> group : groups) {
         NamedList nl = new SimpleOrderedMap();
         groupList.add(nl);                         // grouped={ key={ groups=[ {
         nl.add("groupValue", group.groupValue.toObject());
