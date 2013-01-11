@@ -168,7 +168,7 @@ public class Grouping {
     if (gc.format == Grouping.Format.simple) {
       gc.groupOffset = 0;  // doesn't make sense
     } else if (gc.format == Grouping.Format.custom) {
-      gc.docsPerGroup = gc.numGroups;
+      gc.docsPerGroup = gc.offset + gc.numGroups;
     }
     commands.add(gc);
   }
@@ -702,118 +702,84 @@ public class Grouping {
 
       logger.info("Command::createCustomResponse");
 
+      if (groupedScoreValueSource != null) {
+        for (GroupDocs group : groups) {
+          Map<Integer,Integer> docPositions = new HashMap<Integer,Integer>();
+          int pos = 0;
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            docPositions.put(scoreDoc.doc, pos);
+            pos++;
+          }
+          
+          Map context = ValueSource.newContext(searcher);
+          context.put("docPositions", docPositions);
+          groupedScoreValueSource.createWeight(context, searcher);
+          FunctionValues values = groupedScoreValueSource.getValues(context, null);
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            scoreDoc.score = values.floatVal(scoreDoc.doc) * scoreDoc.score;
+          }
+        }
+      }
+      
       List<Integer> ids = new ArrayList<Integer>();
-      List<CustomScoreDoc> customScoreDocs = new ArrayList<CustomScoreDoc>();
-      int groupsToGather = getMax(offset, numGroups, maxDoc);
-      int groupsGathered = 0;
-      int docsGathered = 0;
-      float maxScore = Float.NEGATIVE_INFINITY;
-
-      Map<Integer, Integer> docPositions = new HashMap<Integer, Integer>();
-      Map<GROUP_VALUE_TYPE, GroupDocs> groupsMap = new HashMap<GROUP_VALUE_TYPE, GroupDocs>();
-
-      for (GroupDocs<GROUP_VALUE_TYPE> group : groups) {
-        if (groupsGathered >= groupsToGather) {
+      List<GroupDocs> newGroups = new ArrayList<GroupDocs>();
+      Map<GroupDocs,Integer> currentPos = new HashMap<GroupDocs,Integer>();
+      int lastGroupIdx = 0;
+      if (groups.length > 0) {
+        currentPos.put(groups[0], 0);
+      }
+      
+      while (newGroups.size() < offset + numGroups) {
+        if (currentPos.isEmpty()) {
           break;
         }
-        
-        int pos = 0;
-        for (ScoreDoc scoreDoc : group.scoreDocs) {
-          docPositions.put(scoreDoc.doc, pos);
-          customScoreDocs.add(new CustomScoreDoc(scoreDoc.doc, scoreDoc.score, scoreDoc.shardIndex, group.groupValue));
-          docsGathered++;
-            
-          pos++;
-          if (pos >= groupsToGather - groupsGathered + docsPerGroupCustom) {
-            break;
+        GroupDocs<GROUP_VALUE_TYPE> selectedGroup = null;
+        ScoreDoc selectedDoc = null;
+        // find doc with max score
+        for (GroupDocs group : currentPos.keySet()) {
+          int pos = currentPos.get(group);
+          ScoreDoc doc = group.scoreDocs[pos];
+          if (selectedDoc == null || selectedDoc.score <= doc.score) {
+            selectedGroup = group;
+            selectedDoc = doc;
           }
         }
-
-        groupsMap.put(group.groupValue, group);
-        groupsGathered++;
-      }
-
-      if (groupedScoreValueSource != null) {
-        Map context = ValueSource.newContext(searcher);
-        context.put("docPositions", docPositions);
-        groupedScoreValueSource.createWeight(context, searcher);
-        FunctionValues values = groupedScoreValueSource.getValues(context, null);
-
-        for (CustomScoreDoc scoreDoc : customScoreDocs) {
-          scoreDoc.score = values.floatVal(scoreDoc.doc) * scoreDoc.score;
+        // if selecting from last group should and next one to available
+        if (selectedGroup == groups[lastGroupIdx]
+            && lastGroupIdx < groups.length - 1) {
+          lastGroupIdx++;
+          currentPos.put(groups[lastGroupIdx], 0);
         }
+        
+        int nextIdx = currentPos.get(selectedGroup) + 1;
+        if (nextIdx < selectedGroup.scoreDocs.length) {
+          currentPos.put(selectedGroup, nextIdx);
+        } else {
+          currentPos.remove(selectedGroup);
+        }
+        // scoreDocs for new group
+        ScoreDoc[] scoreDocs = (ScoreDoc[]) ArrayUtils.removeElement(
+            selectedGroup.scoreDocs, selectedDoc);
+        scoreDocs = (ScoreDoc[]) ArrayUtils.add(scoreDocs, 0, selectedDoc);
+        scoreDocs = (ScoreDoc[]) ArrayUtils.subarray(scoreDocs, groupOffset,
+            groupOffset + docsPerGroupCustom + 1);
+        
+        newGroups.add(new GroupDocs<GROUP_VALUE_TYPE>(Float.NaN,
+            selectedDoc.score, selectedGroup.totalHits, scoreDocs,
+            selectedGroup.groupValue, null));
+        ids.add(selectedDoc.doc);
       }
-
-      Collections.sort(customScoreDocs, new CustomScoreDocComparator());
-      if (!customScoreDocs.isEmpty()) {
-        maxScore = customScoreDocs.get(0).score;
-      }
-
-      Map<Integer, Float> customScores = new HashMap<Integer, Float>();
-      for (CustomScoreDoc scoreDoc : customScoreDocs) {
-        ids.add(scoreDoc.doc);
-        customScores.put(scoreDoc.doc, scoreDoc.score);
-      }
-
-      int len = Math.min(docsGathered > offset ? docsGathered - offset : 0, numGroups);
-      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
-
-      if (len == 0) {
+      if (newGroups.size() < offset) {
         return new GroupDocs[0];
       }
-
-      List<GroupDocs> newGroups = new ArrayList<GroupDocs>();
-      for(CustomScoreDoc scoreDoc: customScoreDocs.subList(offset, offset + len)) {
-        GroupDocs group = groupsMap.get(scoreDoc.groupValue);
-        List<ScoreDoc> groupedValues = new ArrayList<ScoreDoc>(Arrays.asList(group.scoreDocs));
-        ListIterator<ScoreDoc> groupedIter = groupedValues.listIterator();
-        while(groupedIter.hasNext()) {
-          ScoreDoc doc = groupedIter.next();
-          if(doc.doc == scoreDoc.doc) {
-            groupedIter.remove();
-          }
-        }
-        groupedValues.add(0, scoreDoc);
-        if(groupedValues.size() > docsPerGroupCustom) {
-          groupedValues = groupedValues.subList(0, docsPerGroupCustom);
-        }
-        for(ScoreDoc doc: groupedValues) {
-            doc.score = customScores.get(doc.doc);
-        }
-        newGroups.add(new GroupDocs<GROUP_VALUE_TYPE>(
-            Float.NaN, scoreDoc.score, group.totalHits, groupedValues.toArray(new ScoreDoc[0]), scoreDoc.groupValue, null));
-      }
-
+      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
       if (getDocList) {
         for (int i = offset; i < docs.length; i++) {
           idSet.add(docs[i]);
         }
       }
-      return newGroups.toArray(new GroupDocs[0]);
+      return newGroups.subList(offset, newGroups.size()).toArray(new GroupDocs[0]);
     }
-
-    private class CustomScoreDoc extends ScoreDoc {
-      public GROUP_VALUE_TYPE groupValue;
-
-      public CustomScoreDoc(int doc, float score, GROUP_VALUE_TYPE groupValue) {
-        this(doc, score, -1, groupValue);
-      }
-      
-      public CustomScoreDoc(int doc, float score, int shardIndex, GROUP_VALUE_TYPE groupValue) {
-        super(doc, score, shardIndex);
-        this.groupValue = groupValue;
-      }
-    }
-    
-    private class CustomScoreDocComparator implements Comparator<CustomScoreDoc> {
-      @Override
-      public int compare(CustomScoreDoc d1, CustomScoreDoc d2) {
-        if (d1.score > d2.score) return -1;
-        if (d1.score == d2.score) return 0;
-        return 1;
-      }
-    }
-
   }
 
   /**
@@ -965,6 +931,9 @@ public class Grouping {
      * {@inheritDoc}
      */
     protected Integer getNumberOfGroups() {
+      if(format == Grouping.Format.custom) {
+        return getMatches();
+      }
       return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
     }
   }
