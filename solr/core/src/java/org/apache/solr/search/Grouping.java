@@ -739,7 +739,9 @@ public class Grouping {
         for (GroupDocs group : currentPos.keySet()) {
           int pos = currentPos.get(group);
           ScoreDoc doc = group.scoreDocs[pos];
-          if (selectedDoc == null || selectedDoc.score <= doc.score) {
+          if ((selectedDoc == null) ||
+              ((selectedDoc.score <= doc.score) && ! sortField.getReverse()) ||
+              ((selectedDoc.score >= doc.score) && sortField.getReverse())) {
             selectedGroup = group;
             selectedDoc = doc;
           }
