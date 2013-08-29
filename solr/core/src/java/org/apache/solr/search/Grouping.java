@@ -128,13 +128,10 @@ public class Grouping {
    * @param field The fieldname to group by.
    */
   public void addFieldCommand(String field, SolrQueryRequest request) throws SyntaxError {
-    logger.info("Grouping::addFieldCommand");
-
     SchemaField schemaField = searcher.getSchema().getField(field); // Throws an exception when field doesn't exist. Bad request.
     FieldType fieldType = schemaField.getType();
     ValueSource valueSource = fieldType.getValueSource(schemaField, null);
     if (!(valueSource instanceof StrFieldSource)) {
-      logger.info("!(valueSource instanceof StrFieldSource)");
       addFunctionCommand(field, request);
       return;
     }
@@ -169,8 +166,6 @@ public class Grouping {
   }
 
   public void addFunctionCommand(String groupByStr, SolrQueryRequest request) throws SyntaxError {
-    logger.info("Grouping::addFunctionCommand");
-
     QParser parser = QParser.getParser(groupByStr, "func", request);
     Query q = parser.getQuery();
     final Grouping.Command gc;
@@ -720,10 +715,9 @@ public class Grouping {
         return groups;
       }
 
-      logger.info("Command::createCustomResponse");
+      logger.debug("Command::createCustomResponse");
 
       if (groupedScoreValueSource != null) {
-        logger.info("groupedScoreValueSource != null");
         for (GroupDocs group : groups) {
           Map<Integer,Integer> docPositions = new HashMap<Integer,Integer>();
           int pos = 0;
@@ -738,7 +732,6 @@ public class Grouping {
           FunctionValues values = groupedScoreValueSource.getValues(context, null);
           for (ScoreDoc scoreDoc : group.scoreDocs) {
             scoreDoc.score = values.floatVal(scoreDoc.doc) * scoreDoc.score;
-            logger.info("{}: {}", scoreDoc.doc, scoreDoc.score);
           }
         }
       }
@@ -961,9 +954,7 @@ public class Grouping {
      */
     @Override
     protected Integer getNumberOfGroups() {
-      logger.info("CommandField::getNubmerOfGroups");
       if(format == Grouping.Format.custom) {
-        logger.info("{}", getMatches());
         return getMatches();
       }
       return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
@@ -1173,9 +1164,7 @@ public class Grouping {
      */
     @Override
     protected Integer getNumberOfGroups() {
-      logger.info("CommandFunc::getNubmerOfGroups");
       if(format == Grouping.Format.custom) {
-        logger.info("{}", getMatches());
         return getMatches();
       }
       return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
