@@ -21,6 +21,7 @@ import org.apache.commons.lang.ArrayUtils;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.queries.function.FunctionQuery;
 import org.apache.lucene.queries.function.ValueSource;
+import org.apache.lucene.queries.function.FunctionValues;
 import org.apache.lucene.queries.function.valuesource.QueryValueSource;
 import org.apache.lucene.search.*;
 import org.apache.lucene.search.grouping.*;
@@ -127,10 +128,13 @@ public class Grouping {
    * @param field The fieldname to group by.
    */
   public void addFieldCommand(String field, SolrQueryRequest request) throws SyntaxError {
+    logger.info("Grouping::addFieldCommand");
+
     SchemaField schemaField = searcher.getSchema().getField(field); // Throws an exception when field doesn't exist. Bad request.
     FieldType fieldType = schemaField.getType();
     ValueSource valueSource = fieldType.getValueSource(schemaField, null);
     if (!(valueSource instanceof StrFieldSource)) {
+      logger.info("!(valueSource instanceof StrFieldSource)");
       addFunctionCommand(field, request);
       return;
     }
@@ -147,6 +151,10 @@ public class Grouping {
     gc.format = defaultFormat;
     gc.totalCount = defaultTotalCount;
 
+    // custom grouping
+    gc.docsPerGroupCustom = gc.docsPerGroup;
+    gc.groupedScoreValueSource = getGroupedScoreValueSource(request);
+
     if (main) {
       gc.main = true;
       gc.format = Grouping.Format.simple;
@@ -154,11 +162,15 @@ public class Grouping {
 
     if (gc.format == Grouping.Format.simple) {
       gc.groupOffset = 0;  // doesn't make sense
+    } else if (gc.format == Grouping.Format.custom) {
+      gc.docsPerGroup = gc.offset + gc.numGroups;
     }
     commands.add(gc);
   }
 
   public void addFunctionCommand(String groupByStr, SolrQueryRequest request) throws SyntaxError {
+    logger.info("Grouping::addFunctionCommand");
+
     QParser parser = QParser.getParser(groupByStr, "func", request);
     Query q = parser.getQuery();
     final Grouping.Command gc;
@@ -189,6 +201,10 @@ public class Grouping {
     gc.format = defaultFormat;
     gc.totalCount = defaultTotalCount;
 
+    // custom grouping
+    gc.docsPerGroupCustom = gc.docsPerGroup;
+    gc.groupedScoreValueSource = getGroupedScoreValueSource(request);
+    
     if (main) {
       gc.main = true;
       gc.format = Grouping.Format.simple;
@@ -196,6 +212,8 @@ public class Grouping {
 
     if (gc.format == Grouping.Format.simple) {
       gc.groupOffset = 0;  // doesn't make sense
+    } else if (gc.format == Grouping.Format.custom) {
+      gc.docsPerGroup = gc.offset + gc.numGroups;
     }
 
     commands.add(gc);
@@ -217,6 +235,10 @@ public class Grouping {
     gc.numGroups = limitDefault;
     gc.format = defaultFormat;
 
+    // custom grouping
+    gc.docsPerGroupCustom = gc.docsPerGroup;
+    gc.groupedScoreValueSource = getGroupedScoreValueSource(request);
+    
     if (main) {
       gc.main = true;
       gc.format = Grouping.Format.simple;
@@ -224,9 +246,25 @@ public class Grouping {
     if (gc.format == Grouping.Format.simple) {
       gc.docsPerGroup = gc.numGroups;  // doesn't make sense to limit to one
       gc.groupOffset = gc.offset;
+    } else if (gc.format == Grouping.Format.custom) {
+      gc.docsPerGroup = gc.offset + gc.numGroups;
     }
 
     commands.add(gc);
+  }
+
+  public ValueSource getGroupedScoreValueSource(SolrQueryRequest request) throws SyntaxError {
+    String customScoreBoostFunc = request.getParams().get("group.bf");
+
+    if (customScoreBoostFunc != null) {
+      QParser parser = QParser.getParser(customScoreBoostFunc, "func", request);
+      Query q = parser.getQuery();
+      if (q instanceof FunctionQuery) {
+        return ((FunctionQuery) q).getValueSource();
+      }
+    }
+
+    return null;
   }
 
   public Grouping setSort(Sort sort) {
@@ -467,7 +505,12 @@ public class Grouping {
     /**
      * Flat result. All documents of all groups are put in one list.
      */
-    simple
+    simple,
+
+    /**
+     * Flat result. All documents of all groups are put in one list sorted by special rules.
+     */
+    custom
   }
 
   public static enum TotalCount {
@@ -495,6 +538,7 @@ public class Grouping {
     public Sort groupSort;   // the sort of the documents *within* a single group.
     public Sort sort;        // the sort between groups
     public int docsPerGroup; // how many docs in each group - from "group.limit" param, default=1
+    public int docsPerGroupCustom; //used by custom search to store actual docsPerGroup
     public int groupOffset;  // the offset within each group (for paging within each group)
     public int numGroups;    // how many groups - defaults to the "rows" parameter
     int actualGroupsToFind;  // How many groups should actually be found. Based on groupOffset and numGroups.
@@ -502,6 +546,8 @@ public class Grouping {
     public Format format;
     public boolean main;     // use as the main result in simple format (grouped.main=true param)
     public TotalCount totalCount = TotalCount.ungrouped;
+
+    public ValueSource groupedScoreValueSource;    
 
     TopGroups<GROUP_VALUE_TYPE> result;
 
@@ -590,7 +636,10 @@ public class Grouping {
       if (format == Format.simple) {
         off = offset;
         len = numGroups;
+      } else if (format == Format.custom) {
+        len = docsPerGroupCustom;
       }
+
       int docsToCollect = getMax(off, len, max);
 
       // TODO: implement a DocList impl that doesn't need to start at offset=0
@@ -661,6 +710,100 @@ public class Grouping {
       return docSlice;
     }
 
+    // Flatten the groups and get up offset + rows documents with custom rules
+    protected GroupDocs[] createCustomResponse() throws IOException {
+      GroupDocs[] groups = result != null ? result.groups : new GroupDocs[0];
+      SortField sortField = sort.getSort()[0];
+      SortField groupSortField = groupSort.getSort()[0];
+      if (sortField.getType() != SortField.Type.SCORE
+          || groupSortField.getType() != SortField.Type.SCORE) {
+        return groups;
+      }
+
+      logger.info("Command::createCustomResponse");
+
+      if (groupedScoreValueSource != null) {
+        logger.info("groupedScoreValueSource != null");
+        for (GroupDocs group : groups) {
+          Map<Integer,Integer> docPositions = new HashMap<Integer,Integer>();
+          int pos = 0;
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            docPositions.put(scoreDoc.doc, pos);
+            pos++;
+          }
+          
+          Map context = ValueSource.newContext(searcher);
+          context.put("docPositions", docPositions);
+          groupedScoreValueSource.createWeight(context, searcher);
+          FunctionValues values = groupedScoreValueSource.getValues(context, null);
+          for (ScoreDoc scoreDoc : group.scoreDocs) {
+            scoreDoc.score = values.floatVal(scoreDoc.doc) * scoreDoc.score;
+            logger.info("{}: {}", scoreDoc.doc, scoreDoc.score);
+          }
+        }
+      }
+      
+      List<Integer> ids = new ArrayList<Integer>();
+      List<GroupDocs> newGroups = new ArrayList<GroupDocs>();
+      Map<GroupDocs,Integer> currentPos = new HashMap<GroupDocs,Integer>();
+      int lastGroupIdx = 0;
+      if (groups.length > 0) {
+        currentPos.put(groups[0], 0);
+      }
+      
+      while (newGroups.size() < offset + numGroups) {
+        if (currentPos.isEmpty()) {
+          break;
+        }
+        GroupDocs<GROUP_VALUE_TYPE> selectedGroup = null;
+        ScoreDoc selectedDoc = null;
+        // find doc with max score
+        for (GroupDocs group : currentPos.keySet()) {
+          int pos = currentPos.get(group);
+          ScoreDoc doc = group.scoreDocs[pos];
+          if ((selectedDoc == null) ||
+              ((selectedDoc.score <= doc.score) && ! sortField.getReverse()) ||
+              ((selectedDoc.score >= doc.score) && sortField.getReverse())) {
+            selectedGroup = group;
+            selectedDoc = doc;
+          }
+        }
+        // if selecting from last group should and next one to available
+        if (selectedGroup == groups[lastGroupIdx]
+            && lastGroupIdx < groups.length - 1) {
+          lastGroupIdx++;
+          currentPos.put(groups[lastGroupIdx], 0);
+        }
+        
+        int nextIdx = currentPos.get(selectedGroup) + 1;
+        if (nextIdx < selectedGroup.scoreDocs.length) {
+          currentPos.put(selectedGroup, nextIdx);
+        } else {
+          currentPos.remove(selectedGroup);
+        }
+        // scoreDocs for new group
+        ScoreDoc[] scoreDocs = (ScoreDoc[]) ArrayUtils.removeElement(
+            selectedGroup.scoreDocs, selectedDoc);
+        scoreDocs = (ScoreDoc[]) ArrayUtils.add(scoreDocs, 0, selectedDoc);
+        scoreDocs = (ScoreDoc[]) ArrayUtils.subarray(scoreDocs, groupOffset,
+            groupOffset + docsPerGroupCustom + 1);
+        
+        newGroups.add(new GroupDocs<GROUP_VALUE_TYPE>(Float.NaN,
+            selectedDoc.score, selectedGroup.totalHits, scoreDocs,
+            selectedGroup.groupValue, null));
+        ids.add(selectedDoc.doc);
+      }
+      if (newGroups.size() < offset) {
+        return new GroupDocs[0];
+      }
+      int[] docs = ArrayUtils.toPrimitive(ids.toArray(new Integer[ids.size()]));
+      if (getDocList) {
+        for (int i = offset; i < docs.length; i++) {
+          idSet.add(docs[i]);
+        }
+      }
+      return newGroups.subList(offset, newGroups.size()).toArray(new GroupDocs[0]);
+    }
   }
 
   /**
@@ -764,7 +907,6 @@ public class Grouping {
         groupResult.add("doclist", createSimpleResponse());
         return;
       }
-
       List groupList = new ArrayList();
       groupResult.add("groups", groupList);        // grouped={ key={ groups=[
 
@@ -772,10 +914,15 @@ public class Grouping {
         return;
       }
 
+      GroupDocs[] groups = result.groups;
+      if (format == Format.custom) {
+        groups = createCustomResponse();
+      }
+
       // handle case of rows=0
       if (numGroups == 0) return;
 
-      for (GroupDocs<BytesRef> group : result.groups) {
+      for (GroupDocs<BytesRef> group : groups) {
         NamedList nl = new SimpleOrderedMap();
         groupList.add(nl);                         // grouped={ key={ groups=[ {
 
@@ -814,6 +961,11 @@ public class Grouping {
      */
     @Override
     protected Integer getNumberOfGroups() {
+      logger.info("CommandField::getNubmerOfGroups");
+      if(format == Grouping.Format.custom) {
+        logger.info("{}", getMatches());
+        return getMatches();
+      }
       return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
     }
   }
@@ -981,7 +1133,6 @@ public class Grouping {
         groupResult.add("doclist", createSimpleResponse());
         return;
       }
-
       List groupList = new ArrayList();
       groupResult.add("groups", groupList);        // grouped={ key={ groups=[
 
@@ -989,10 +1140,15 @@ public class Grouping {
         return;
       }
 
+      GroupDocs[] groups = result.groups;
+      if (format == Format.custom) {
+        groups = createCustomResponse();
+      }
+
       // handle case of rows=0
       if (numGroups == 0) return;
 
-      for (GroupDocs<MutableValue> group : result.groups) {
+      for (GroupDocs<MutableValue> group : groups) {
         NamedList nl = new SimpleOrderedMap();
         groupList.add(nl);                         // grouped={ key={ groups=[ {
         nl.add("groupValue", group.groupValue.toObject());
@@ -1017,6 +1173,11 @@ public class Grouping {
      */
     @Override
     protected Integer getNumberOfGroups() {
+      logger.info("CommandFunc::getNubmerOfGroups");
+      if(format == Grouping.Format.custom) {
+        logger.info("{}", getMatches());
+        return getMatches();
+      }
       return allGroupsCollector == null ? null : allGroupsCollector.getGroupCount();
     }
 
